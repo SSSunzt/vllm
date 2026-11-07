@@ -3462,6 +3462,13 @@ class VllmConfig:
             )
         elif not self.use_v2_model_runner:
             unsupported = "it requires the V2 model runner"
+        elif (
+            speculative_config := getattr(self, "speculative_config", None)
+        ) is not None and speculative_config.method in {"dflash", "dspark"}:
+            unsupported = (
+                "DFlash and DSpark may use an independent bounded draft KV "
+                "pool, whose capacity cannot be resized with the target pool"
+            )
         elif self.parallel_config.enable_elastic_ep:
             unsupported = (
                 "elastic EP scale-up skips warmup and reuses the profiled KV "

@@ -2298,6 +2298,37 @@ def test_register_kv_caches(layout: KVCacheLayout, separate_kv_head_groups: bool
             assert worker.registered_layer_indices == [0, 1]
 
 
+def test_register_flat_cache_uses_owning_pool_capacity():
+    spec = FullAttentionSpec(
+        block_size=maybe_update_block_size(16),
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    target_name = "model.layers.0.self_attn"
+    draft_name = "model.layers.1.self_attn"
+    config = KVCacheConfig(
+        num_blocks=8,
+        num_blocks_by_pool=[8, 2],
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([target_name], spec, block_pool_id=0),
+            KVCacheGroupSpec([draft_name], spec, block_pool_id=1),
+        ],
+    )
+    target = torch.zeros(8 * spec.page_size_bytes, dtype=torch.uint8)
+    draft = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8)
+
+    with mooncake_register_worker(config) as (worker, _):
+        worker.register_kv_caches({target_name: target, draft_name: draft})
+
+        assert worker.block_len_per_layer == [
+            spec.page_size_bytes,
+            spec.page_size_bytes,
+        ]
+        assert worker.registered_group_indices == [0, 1]
+
+
 def test_register_noncontiguous_packed_allows_matching_pp():
     """Same PP on both sides can still register a non-contiguous packed row.
 

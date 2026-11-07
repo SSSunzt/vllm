@@ -217,6 +217,9 @@ class Request:
         # DeepSeek-V4.1 only: SWA bounded replay. The request holds no
         # sliding-window KV below this position; 0 when nothing replays.
         self.replay_start = 0
+        # During draft-window recovery, replay must not overwrite target KV
+        # that remains valid up to this boundary.
+        self.draft_recovery_main_cached_end = 0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

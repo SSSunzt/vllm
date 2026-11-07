@@ -371,6 +371,30 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            draft_query_len=(
+                speculative_config.num_speculative_tokens
+                + int(
+                    not getattr(
+                        getattr(
+                            speculative_config.draft_model_config,
+                            "hf_config",
+                            None,
+                        ),
+                        "sample_from_anchor",
+                        True,
+                    )
+                )
+                if speculative_config is not None
+                else 1
+            ),
+            draft_page_rounded=(
+                getattr(
+                    getattr(speculative_config, "attention_backend", None),
+                    "name",
+                    None,
+                )
+                == "FLASHINFER_TS"
+            ),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -378,11 +402,18 @@ class Scheduler(SchedulerInterface):
             if self.num_spec_tokens
             else 0
         )
-        self._spec_decode_step_blocks = sum(
-            cdiv(num_spec_decode_tokens, manager.block_size)
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if not isinstance(manager.kv_cache_spec, MambaSpec)
-        )
+        spec_decode_step_blocks = [0] * len(self.kv_cache_manager.block_pools)
+        for manager, group in zip(
+            self.kv_cache_manager.coordinator.single_type_managers,
+            kv_cache_config.kv_cache_groups,
+            strict=True,
+        ):
+            if not isinstance(manager.kv_cache_spec, MambaSpec):
+                spec_decode_step_blocks[group.block_pool_id] += cdiv(
+                    num_spec_decode_tokens, manager.block_size
+                )
+        self._spec_decode_step_blocks_by_pool = tuple(spec_decode_step_blocks)
+        self._spec_decode_step_blocks = sum(spec_decode_step_blocks)
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -1348,7 +1379,14 @@ class Scheduler(SchedulerInterface):
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
-                        num_replay_tokens = self._mark_prefix_replay(
+                        request.draft_recovery_main_cached_end = 0
+                        num_replay_tokens = (
+                            0
+                            if window_loaded
+                            else self._mark_draft_window_recovery(
+                                request, num_computed_tokens
+                            )
+                        ) or self._mark_prefix_replay(
                             request, num_computed_tokens, window_loaded
                         )
                         num_computed_tokens -= num_replay_tokens
@@ -1489,9 +1527,13 @@ class Scheduler(SchedulerInterface):
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
+                    reserved_blocks = tuple(
+                        inflight + spec_decode
+                        for inflight, spec_decode in zip(
+                            self._inflight_prefill_reserved_blocks(),
+                            self._spec_decode_step_blocks_by_pool,
+                            strict=True,
+                        )
                     )
 
                 # Replayed tokens are already counted in the adopted hit; a
@@ -1857,7 +1899,9 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(
+        self,
+    ) -> list[int] | dict[int, list[int]] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
@@ -3566,11 +3610,15 @@ class Scheduler(SchedulerInterface):
 
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
+        return sum(self._request_remaining_blocks_by_pool(request))
+
+    def _request_remaining_blocks_by_pool(self, request: Request) -> tuple[int, ...]:
+        """Per-pool blocks still needed to complete an in-flight prefill."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         num_tokens = full_num_tokens
         if self.num_spec_tokens:
             num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate_by_pool(
             request_id=request.request_id,
             num_tokens=num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
@@ -3592,11 +3640,15 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+    def _inflight_prefill_reserved_blocks(self) -> tuple[int, ...]:
+        """Per-pool reservation needed for in-flight prefills to finish."""
+        reserved = [0] * len(self.kv_cache_manager.block_pools)
+        for request in self._inflight_prefills:
+            for pool_id, num_blocks in enumerate(
+                self._request_remaining_blocks_by_pool(request)
+            ):
+                reserved[pool_id] += num_blocks
+        return tuple(reserved)
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41
@@ -3626,6 +3678,23 @@ class Scheduler(SchedulerInterface):
         num_replay_tokens = min(self.prefix_replay_tokens, num_hit_tokens)
         request.replay_start = num_hit_tokens - num_replay_tokens
         return num_replay_tokens
+
+    def _mark_draft_window_recovery(self, request: Request, num_hit_tokens: int) -> int:
+        """Rewind to the first draft-window hole while preserving target KV."""
+        request.draft_recovery_main_cached_end = 0
+        plan = self.kv_cache_manager.get_draft_recovery_plan(request.request_id)
+        if plan is None or not plan.replay_ranges:
+            return 0
+        if plan.main_cached_end != num_hit_tokens:
+            return 0
+        if len(plan.replay_ranges) != 1:
+            raise ValueError("draft recovery requires one replay envelope")
+        replay_start, replay_end = plan.replay_ranges[0]
+        if replay_end != plan.main_cached_end:
+            raise ValueError("draft recovery replay must end at the target hit")
+        request.replay_start = replay_start
+        request.draft_recovery_main_cached_end = plan.main_cached_end
+        return replay_end - replay_start
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """KV Connector: update request state after async recv is finished.

@@ -40,6 +40,18 @@ from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
 
+def test_new_kv_blocks_are_zeroed_by_owning_pool():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    pool_zeroers = {0: Mock(), 1: Mock()}
+    runner.kv_block_zeroers = pool_zeroers
+    runner.kv_block_zeroer = pool_zeroers[0]
+
+    runner._zero_new_kv_blocks({0: [7], 1: [2, 3]})
+
+    pool_zeroers[0].zero_block_ids.assert_called_once_with([7])
+    pool_zeroers[1].zero_block_ids.assert_called_once_with([2, 3])
+
+
 @pytest.mark.parametrize("eligible,expected_bound", [(True, 8), (False, None)])
 def test_prompt_tail_keeps_decode_graph_bound(monkeypatch, eligible, expected_bound):
     """A decode-eligible prompt tail must not lose its varlen graph bound."""

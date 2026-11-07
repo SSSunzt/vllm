@@ -23,6 +23,7 @@ from tests.v1.core.utils import (
 from tests.v1.spec_decode.utils import fake_speculative_config
 from vllm.config import (
     CacheConfig,
+    KVTransferConfig,
     ModelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -51,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     HiSparseHotSpec,
     HiSparseResidentSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
@@ -2063,6 +2065,208 @@ def test_eagle_groups_are_the_groups_holding_draft_layers(make_specs, pp):
 def test_no_eagle_groups_without_eagle_block_drop():
     groups = _spec_decode_kv_cache_groups([_hybrid_specs()], use_eagle_block_drop=False)
     assert not any(g.is_eagle_group for g in groups)
+
+
+def test_dflash_sliding_draft_uses_bounded_independent_pool():
+    """A compatible windowed drafter must not widen the target KV pool."""
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=256),
+        scheduler_config=SchedulerConfig(
+            max_model_len=256,
+            max_num_batched_tokens=32,
+            max_num_seqs=2,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+    )
+    config.cache_config.block_size = 16
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.speculative_config = fake_speculative_config(
+        method="dflash",
+        num_speculative_tokens=7,
+        uses_target_hidden_states=True,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+        use_multi_module_mtp=lambda: False,
+        parallel_drafting=False,
+        draft_model_config=SimpleNamespace(architectures=[]),
+    )
+    specs = {
+        "target": new_kv_cache_spec(block_size=16),
+        "draft": replace(
+            new_sliding_window_spec(block_size=16, sliding_window=64),
+            is_draft=True,
+        ),
+    }
+
+    result = get_kv_cache_configs(config, [specs], [2**24])[0]
+
+    assert [group.block_pool_id for group in result.kv_cache_groups] == [0, 1]
+    assert [group.role for group in result.kv_cache_groups] == [
+        KVCacheGroupRole.DEFAULT,
+        KVCacheGroupRole.DRAFT_WINDOW,
+    ]
+    assert result.num_blocks_by_pool[1] == 17
+    assert result.num_blocks_by_pool[0] > result.num_blocks_by_pool[1]
+    assert {
+        tensor.layers[0]: tensor.block_pool_id for tensor in result.kv_cache_tensors
+    } == {"target": 0, "draft": 1}
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "expected_draft_blocks"),
+    [("kv_consumer", 38), ("kv_producer", 17)],
+)
+def test_dflash_pool_counts_async_loads_only_for_consumers(
+    kv_role, expected_draft_blocks
+):
+    """Only consumers hold asynchronously loaded draft windows."""
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=256),
+        scheduler_config=SchedulerConfig(
+            max_model_len=256,
+            max_num_batched_tokens=32,
+            max_num_seqs=2,
+            max_num_inflight_kv_loads=3,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeConnector", kv_role=kv_role
+        ),
+    )
+    config.cache_config.block_size = 16
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.speculative_config = fake_speculative_config(
+        method="dflash",
+        num_speculative_tokens=7,
+        uses_target_hidden_states=True,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+        use_multi_module_mtp=lambda: False,
+        parallel_drafting=False,
+        draft_model_config=SimpleNamespace(architectures=[]),
+    )
+    specs = {
+        "target": new_kv_cache_spec(block_size=16),
+        "draft": replace(
+            new_sliding_window_spec(block_size=16, sliding_window=64),
+            is_draft=True,
+        ),
+    }
+
+    result = get_kv_cache_configs(config, [specs], [2**24])[0]
+
+    assert result.num_blocks_by_pool[1] == expected_draft_blocks
+
+
+def test_dflash_window_pool_memory_check_does_not_require_full_draft_context():
+    """Startup accounts for the bounded draft pool, not a full draft prefix."""
+    max_model_len = 16_384
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=max_model_len),
+        scheduler_config=SchedulerConfig(
+            max_model_len=max_model_len,
+            max_num_batched_tokens=32,
+            max_num_seqs=2,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+    )
+    config.cache_config.block_size = 16
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.speculative_config = fake_speculative_config(
+        method="dflash",
+        num_speculative_tokens=7,
+        uses_target_hidden_states=True,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+        use_multi_module_mtp=lambda: False,
+        parallel_drafting=False,
+        draft_model_config=SimpleNamespace(architectures=[]),
+    )
+    target = new_kv_cache_spec(block_size=16)
+    draft = replace(
+        new_sliding_window_spec(block_size=16, sliding_window=64),
+        is_draft=True,
+    )
+    draft_blocks = 17
+    target_blocks = max_model_len // target.block_size + 1
+    available_memory = (
+        target_blocks * target.page_size_bytes + draft_blocks * draft.page_size_bytes
+    )
+
+    result = get_kv_cache_configs(
+        config, [{"target": target, "draft": draft}], [available_memory]
+    )[0]
+
+    assert result.num_blocks_by_pool == [target_blocks, draft_blocks]
+
+
+def test_dflash_without_target_hidden_states_keeps_shared_pool():
+    """Only target-conditioned window drafters need independent recovery."""
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dflash",
+            uses_target_hidden_states=False,
+        ),
+        parallel_config=SimpleNamespace(),
+    )
+    specs = {
+        "target": new_kv_cache_spec(block_size=16),
+        "draft": replace(
+            new_sliding_window_spec(block_size=16, sliding_window=64),
+            is_draft=True,
+        ),
+    }
+
+    groups = kv_cache_planning._get_independent_draft_window_groups(
+        object(),  # type: ignore[arg-type]
+        config,
+        specs,
+    )
+
+    assert groups is None
+
+
+def test_dflash_window_pool_keeps_shared_layout_for_unsupported_connector():
+    """Independent recovery is not enabled for an unaudited transfer backend."""
+    config = VllmConfig(
+        model_config=ModelConfig(max_model_len=256),
+        scheduler_config=SchedulerConfig(
+            max_model_len=256,
+            max_num_batched_tokens=32,
+            max_num_seqs=2,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
+    )
+    config.speculative_config = fake_speculative_config(
+        method="dflash",
+        num_speculative_tokens=7,
+        uses_target_hidden_states=True,
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+        use_multi_module_mtp=lambda: False,
+        parallel_drafting=False,
+        draft_model_config=SimpleNamespace(architectures=[]),
+    )
+    config.cache_config.block_size = 16
+    config.cache_config.kv_cache_layout = "BLHNC"
+    specs = {
+        "target": new_kv_cache_spec(block_size=16),
+        "draft": replace(
+            new_sliding_window_spec(block_size=16, sliding_window=64),
+            is_draft=True,
+        ),
+    }
+
+    groups = kv_cache_planning.get_global_kv_cache_groups(config, [specs])
+
+    assert {group.block_pool_id for group in groups} == {0}
 
 
 @pytest.mark.parametrize(

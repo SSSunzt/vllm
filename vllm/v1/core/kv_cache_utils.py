@@ -257,6 +257,7 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    pool_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -1093,16 +1094,16 @@ def get_max_concurrency_for_kv_cache_config(
     """Get the maximum concurrency for the given KV cache configuration.
 
     A request at max_model_len consumes whole blocks from each group's block
-    table — cdiv(per-request bytes, page bytes) of the group's spec — and all
-    device groups draw those block ids from one shared pool, so the per-request
-    total is the sum over groups. The memory/page ratio is identical whether
-    a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
-    a representative per-layer spec (scheduler config), so both capacity
-    call sites agree.
+    table — cdiv(per-request bytes, page bytes) of the group's spec. Groups in
+    one allocator domain share its capacity; independent pools impose separate
+    concurrency limits. The memory/page ratio is identical whether a group
+    carries an aggregated UniformTypeKVCacheSpecs (worker config) or a
+    representative per-layer spec (scheduler config), so both capacity call
+    sites agree.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
-    num_blocks_per_request = 0
+    blocks_per_request_by_pool = [0] * len(kv_cache_config.num_blocks_by_pool)
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
         required = cdiv(
@@ -1112,8 +1113,16 @@ def get_max_concurrency_for_kv_cache_config(
         if group.host_resident:
             host_blocks_per_request += required
         else:
-            num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+            blocks_per_request_by_pool[group.block_pool_id] += required
+    limits = [
+        num_blocks / required
+        for num_blocks, required in zip(
+            kv_cache_config.num_blocks_by_pool,
+            blocks_per_request_by_pool,
+            strict=True,
+        )
+        if required
+    ]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
@@ -1127,7 +1136,8 @@ def generate_scheduler_kv_cache_config(
 ) -> KVCacheConfig:
     """Generate the KV cache configuration for the scheduler."""
     assert all(
-        [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+        cfg.num_blocks_by_pool == kv_cache_configs[0].num_blocks_by_pool
+        for cfg in kv_cache_configs
     )
     assert all(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
