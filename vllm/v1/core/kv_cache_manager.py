@@ -9,16 +9,24 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.draft_window_recovery import (
+    DraftWindowRecoveryPlan,
+    plan_draft_window_recovery,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    DFlashSlidingWindowManager,
+    MambaManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
+    DFlashSlidingWindowSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -147,6 +155,8 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        draft_query_len: int = 1,
+        draft_page_rounded: bool | Sequence[bool] = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -197,6 +207,28 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self._draft_window_managers = tuple(
+            manager
+            for group, manager in zip(
+                kv_cache_config.kv_cache_groups,
+                self.coordinator.single_type_managers,
+                strict=True,
+            )
+            if isinstance(group.kv_cache_spec, DFlashSlidingWindowSpec)
+            and isinstance(manager, DFlashSlidingWindowManager)
+        )
+        self._draft_recovery_plans: dict[str, DraftWindowRecoveryPlan] = {}
+        self._draft_query_len = draft_query_len
+        if isinstance(draft_page_rounded, bool):
+            self._draft_page_rounded = (draft_page_rounded,) * len(
+                self._draft_window_managers
+            )
+        else:
+            self._draft_page_rounded = tuple(draft_page_rounded)
+            if len(self._draft_page_rounded) != len(self._draft_window_managers):
+                raise ValueError(
+                    "draft_page_rounded must contain one value per draft group"
+                )
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -308,11 +340,57 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
+        independent_blocks: tuple[list[KVCacheBlock], ...] | None = None
+        independent_hits: tuple[int, ...] | None = None
+        if self._draft_window_managers:
+            assert isinstance(self.coordinator, HybridKVCacheCoordinator)
+            independent_blocks, independent_hits = (
+                self.coordinator.find_longest_cache_hit_per_group(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if independent_blocks is not None and independent_hits is not None:
+            draft_group_ids = {
+                manager.kv_cache_group_id for manager in self._draft_window_managers
+            }
+            main_group_ids = [
+                group_id
+                for group_id in range(len(independent_hits))
+                if group_id not in draft_group_ids
+            ]
+            main_hit = min(
+                (independent_hits[group_id] for group_id in main_group_ids),
+                default=num_new_computed_tokens,
+            )
+            if main_hit > num_new_computed_tokens:
+                plan, ready_draft_blocks = self._plan_draft_recovery(
+                    request,
+                    main_cached_end=main_hit,
+                    joint_cached_end=num_new_computed_tokens,
+                )
+                recovery_groups: list[list[KVCacheBlock]] = []
+                for group_id, group_blocks in enumerate(independent_blocks):
+                    if group_id in ready_draft_blocks:
+                        recovery_groups.append(ready_draft_blocks[group_id])
+                        continue
+                    manager = self.coordinator.single_type_managers[group_id]
+                    recovery_groups.append(
+                        group_blocks[: cdiv(main_hit, manager.block_size)]
+                    )
+                computed_blocks = tuple(recovery_groups)
+                num_new_computed_tokens = main_hit
+                num_uncached = 0
+                if plan.replay_ranges:
+                    self._draft_recovery_plans[request.request_id] = plan
+                else:
+                    self._draft_recovery_plans.pop(request.request_id, None)
+            else:
+                self._draft_recovery_plans.pop(request.request_id, None)
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -334,6 +412,85 @@ class KVCacheManager:
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def get_draft_recovery_plan(
+        self, request_id: str
+    ) -> DraftWindowRecoveryPlan | None:
+        """Return the recovery plan produced by the latest prefix lookup."""
+        return self._draft_recovery_plans.get(request_id)
+
+    def _find_draft_ready_blocks(
+        self,
+        manager: DFlashSlidingWindowManager,
+        request: Request,
+        start: int,
+        end: int,
+    ) -> tuple[list[KVCacheBlock], tuple[tuple[int, int], ...]]:
+        block_size = manager.block_size
+        group_id = manager.kv_cache_group_id
+        blocks = [manager.block_pool.null_block] * cdiv(end, block_size)
+        ready_ranges: list[tuple[int, int]] = []
+        ready_start: int | None = None
+        for block_index in range(start // block_size, end // block_size):
+            cached = manager.block_pool.get_cached_block(
+                request.block_hashes[block_index], [group_id]
+            )
+            position = block_index * block_size
+            if cached is not None:
+                blocks[block_index] = cached[0]
+                if ready_start is None:
+                    ready_start = position
+            elif ready_start is not None:
+                ready_ranges.append((ready_start, position))
+                ready_start = None
+        if ready_start is not None:
+            ready_ranges.append((ready_start, end))
+        return blocks, tuple(ready_ranges)
+
+    def _plan_draft_recovery(
+        self,
+        request: Request,
+        main_cached_end: int,
+        joint_cached_end: int,
+    ) -> tuple[DraftWindowRecoveryPlan, dict[int, list[KVCacheBlock]]]:
+        managers = self._draft_window_managers
+
+        def make_plan(
+            ready_ranges: tuple[tuple[tuple[int, int], ...], ...],
+        ) -> DraftWindowRecoveryPlan:
+            return plan_draft_window_recovery(
+                request_id=request.request_id,
+                main_cached_end=main_cached_end,
+                joint_cached_end=joint_cached_end,
+                consumer_boundary=min(request.num_tokens, self.max_model_len),
+                window_sizes=tuple(manager.sliding_window for manager in managers),
+                block_sizes=tuple(manager.block_size for manager in managers),
+                query_len=self._draft_query_len,
+                max_model_len=self.max_model_len,
+                page_rounded=self._draft_page_rounded,
+                draft_ready_ranges=ready_ranges,
+            )
+
+        envelope = make_plan(tuple(() for _ in managers))
+        ready_blocks: dict[int, list[KVCacheBlock]] = {}
+        ready_ranges = []
+        for manager, (required_start, _) in zip(
+            managers, envelope.required_ranges, strict=True
+        ):
+            blocks, ranges = self._find_draft_ready_blocks(
+                manager, request, required_start, main_cached_end
+            )
+            ready_blocks[manager.kv_cache_group_id] = blocks
+            ready_ranges.append(ranges)
+        plan = make_plan(tuple(ready_ranges))
+
+        for replay_start, replay_end in plan.replay_ranges:
+            for manager in managers:
+                blocks = ready_blocks[manager.kv_cache_group_id]
+                first = replay_start // manager.block_size
+                last = replay_end // manager.block_size
+                blocks[first:last] = [manager.block_pool.null_block] * (last - first)
+        return plan, ready_blocks
 
     def get_computed_blocks_for_connector(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -383,6 +540,23 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
+
+    def _include_draft_recovery_demand(
+        self,
+        required: Sequence[int],
+        computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        plan: DraftWindowRecoveryPlan | None,
+    ) -> tuple[int, ...]:
+        if plan is None or not plan.replay_ranges:
+            return tuple(required)
+        result = list(required)
+        for manager in self._draft_window_managers:
+            group_id = manager.kv_cache_group_id
+            pool_id = self.kv_cache_config.kv_cache_groups[group_id].pool_id
+            result[pool_id] += manager.count_null_blocks(
+                computed_blocks[group_id], plan.replay_ranges
+            )
+        return tuple(result)
 
     def allocate_slots(
         self,
@@ -552,6 +726,11 @@ class KVCacheManager:
                     prefill_end=prefill_end,
                 )
             )
+            num_blocks_to_allocate = self._include_draft_recovery_demand(
+                num_blocks_to_allocate,
+                new_computed_block_list,
+                self._draft_recovery_plans.get(request.request_id),
+            )
             if not self._fits_free_blocks(num_blocks_to_allocate, apply_watermark):
                 return None
 
@@ -586,6 +765,12 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
         )
+        recovery_plan = self._draft_recovery_plans.get(request.request_id)
+        num_blocks_to_allocate = self._include_draft_recovery_demand(
+            num_blocks_to_allocate,
+            new_computed_block_list,
+            recovery_plan,
+        )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
@@ -609,12 +794,26 @@ class KVCacheManager:
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
             )
 
+        recovery_blocks: dict[int, list[KVCacheBlock]] = {}
+        if recovery_plan is not None and recovery_plan.replay_ranges:
+            recovery_blocks = {
+                manager.kv_cache_group_id: manager.replace_null_blocks(
+                    request.request_id, recovery_plan.replay_ranges
+                )
+                for manager in self._draft_window_managers
+            }
+
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if recovery_blocks:
+            groups = [list(group) for group in new_blocks]
+            for group_id, blocks in recovery_blocks.items():
+                groups[group_id] = blocks + groups[group_id]
+            new_blocks = tuple(groups)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -666,6 +865,7 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        self._draft_recovery_plans.pop(request.request_id, None)
 
     def remove_skipped_blocks(
         self,
@@ -699,6 +899,7 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._draft_recovery_plans.pop(request.request_id, None)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -722,6 +923,7 @@ class KVCacheManager:
         """
         if not self.coordinator.reset_prefix_cache():
             return False
+        self._draft_recovery_plans.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

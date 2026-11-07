@@ -16,6 +16,7 @@ import torch
 
 import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+from tests.v1.core.utils import create_scheduler
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import (
     MEDIUM_CPU,
@@ -76,6 +77,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 
 pytestmark = pytest.mark.cpu_test
 
@@ -5164,6 +5166,127 @@ def test_draft_kv_pool_allocates_drafter_blocks_from_its_own_pool():
     assert manager.allocate_slots(req1, 40, reserved_blocks=[0, 1]) is None
     blocks = manager.allocate_slots(req1, 40, reserved_blocks=[0, 0])
     assert blocks is not None
+
+
+@pytest.mark.skip_global_cleanup
+def test_draft_window_hole_preserves_the_longer_main_cache_hit():
+    """A missing drafter block must not discard reusable target KV."""
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                DFlashSlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=16,
+                    num_speculative_tokens=2,
+                ),
+                pool_id=1,
+            ),
+        ],
+        pool_num_blocks={1: 16},
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    producer = make_request("producer", list(range(64)), block_size, sha256)
+    assert manager.allocate_slots(producer, producer.num_tokens) is not None
+    producer.num_computed_tokens = producer.num_tokens
+    manager.cache_blocks(producer, producer.num_computed_tokens)
+    missing_block_id = manager.get_blocks(producer.request_id).blocks[1][14].block_id
+    manager.free(producer)
+    manager.coordinator.block_pools[1].evict_blocks({missing_block_id})
+
+    consumer = make_request("consumer", list(range(64)), block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(consumer)
+    plan = manager.get_draft_recovery_plan(consumer.request_id)
+
+    assert num_computed_tokens == 60
+    assert plan is not None
+    assert plan.main_cached_end == 60
+    assert plan.joint_cached_end == 56
+    assert plan.replay_ranges == ((56, 60),)
+
+
+@pytest.mark.skip_global_cleanup
+def test_scheduler_replays_only_the_draft_window_hole():
+    block_size = 4
+    base = create_scheduler(block_size=block_size, enable_prefix_caching=True)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                DFlashSlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=16,
+                    num_speculative_tokens=2,
+                ),
+                pool_id=1,
+            ),
+        ],
+        pool_num_blocks={1: 32},
+    )
+    scheduler = Scheduler(
+        vllm_config=base.vllm_config,
+        kv_cache_config=kv_cache_config,
+        block_size=block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base.vllm_config),
+    )
+    manager = scheduler.kv_cache_manager
+    producer = make_request("producer", list(range(64)), block_size, sha256)
+    assert manager.allocate_slots(producer, producer.num_tokens) is not None
+    producer.num_computed_tokens = producer.num_tokens
+    manager.cache_blocks(producer, producer.num_computed_tokens)
+    missing_block_id = manager.get_blocks(producer.request_id).blocks[1][14].block_id
+    manager.free(producer)
+    manager.coordinator.block_pools[1].evict_blocks({missing_block_id})
+
+    consumer = make_request("consumer", list(range(64)), block_size, sha256)
+    scheduler.add_request(consumer)
+    output = scheduler.schedule()
+    scheduled = next(
+        request
+        for request in output.scheduled_new_reqs
+        if request.req_id == consumer.request_id
+    )
+
+    assert scheduled.num_computed_tokens == 56
+    assert scheduled.replay_start == 56
+    assert scheduled.draft_recovery_main_cached_end == 60
+    assert output.num_scheduled_tokens[consumer.request_id] == 8
+    assert scheduled.block_ids[1][14] != 0
 
 
 def test_hybrid_cache_blocks_clamped_to_lcm():

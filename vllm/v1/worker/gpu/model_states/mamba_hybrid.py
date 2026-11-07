@@ -247,6 +247,9 @@ class MambaHybridModelState(DefaultModelState):
         else:
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
+        self._protect_draft_recovery_main_slots(
+            input_batch, slot_mappings, kv_cache_config
+        )
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         # Prefer the promised bound: a capture dummy's measured max is its even
         # split, not the length the graph must replay.

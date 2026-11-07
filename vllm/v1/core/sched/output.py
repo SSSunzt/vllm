@@ -55,6 +55,8 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # Target KV below this boundary is protected during draft-window replay.
+    draft_recovery_main_cached_end: int = 0
 
     @classmethod
     def from_request(
@@ -81,6 +83,7 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            draft_recovery_main_cached_end=request.draft_recovery_main_cached_end,
         )
 
     def __setstate__(self, state: dict) -> None:

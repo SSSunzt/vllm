@@ -370,6 +370,30 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            draft_query_len=(
+                speculative_config.num_speculative_tokens
+                + int(
+                    not getattr(
+                        getattr(
+                            speculative_config.draft_model_config,
+                            "hf_config",
+                            None,
+                        ),
+                        "sample_from_anchor",
+                        True,
+                    )
+                )
+                if speculative_config is not None
+                else 1
+            ),
+            draft_page_rounded=(
+                getattr(
+                    getattr(speculative_config, "attention_backend", None),
+                    "name",
+                    None,
+                )
+                == "FLASHINFER_TS"
+            ),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -1338,7 +1362,14 @@ class Scheduler(SchedulerInterface):
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
-                        num_replay_tokens = self._mark_prefix_replay(
+                        request.draft_recovery_main_cached_end = 0
+                        num_replay_tokens = (
+                            0
+                            if window_loaded
+                            else self._mark_draft_window_recovery(
+                                request, num_computed_tokens
+                            )
+                        ) or self._mark_prefix_replay(
                             request, num_computed_tokens, window_loaded
                         )
                         num_computed_tokens -= num_replay_tokens
@@ -3566,6 +3597,23 @@ class Scheduler(SchedulerInterface):
         num_replay_tokens = min(self.prefix_replay_tokens, num_hit_tokens)
         request.replay_start = num_hit_tokens - num_replay_tokens
         return num_replay_tokens
+
+    def _mark_draft_window_recovery(self, request: Request, num_hit_tokens: int) -> int:
+        """Rewind to the first draft-window hole while preserving target KV."""
+        request.draft_recovery_main_cached_end = 0
+        plan = self.kv_cache_manager.get_draft_recovery_plan(request.request_id)
+        if plan is None or not plan.replay_ranges:
+            return 0
+        if plan.main_cached_end != num_hit_tokens:
+            return 0
+        if len(plan.replay_ranges) != 1:
+            raise ValueError("draft recovery requires one replay envelope")
+        replay_start, replay_end = plan.replay_ranges[0]
+        if replay_end != plan.main_cached_end:
+            raise ValueError("draft recovery replay must end at the target hit")
+        request.replay_start = replay_start
+        request.draft_recovery_main_cached_end = plan.main_cached_end
+        return replay_end - replay_start
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """KV Connector: update request state after async recv is finished.
